@@ -1,10 +1,12 @@
 
+import os
+import io
 import streamlit as st
 import pandas as pd
 import requests
 
-# Base URL of the Flask backend
-BACKEND_URL = "http://backend:7860"
+# Base URL of the Flask backend (container name 'backend' on the shared Docker network; override with BACKEND_URL)
+BACKEND_URL = os.environ.get("BACKEND_URL", "http://backend:7860")
 
 # Page title
 st.title("SuperKart System")
@@ -38,20 +40,25 @@ product_data = {
     "Product_Type_Category": Product_Type_Category
 }
 
+def api_error(response):
+    # Show the error message returned by the API (if any)
+    try:
+        detail = response.json().get("error", response.text)
+    except Exception:
+        detail = response.text
+    st.error(f"Prediction failed (HTTP {response.status_code}): {detail}")
+
 # Single Prediction
 if st.button("Predict", type='primary'):
-
-    response = requests.post(
-        f"{BACKEND_URL}/v1/predict",
-        json=product_data
-    )
-
-    if response.status_code == 200:
-        result = response.json()
-        predicted_sales = result["Sales"]
-        st.success(f"Predicted Product Store Sales Total: ₹{predicted_sales:.2f}")
-    else:
-        st.error("Unable to connect to the prediction API.")
+    try:
+        response = requests.post(f"{BACKEND_URL}/v1/predict", json=product_data, timeout=30)
+        if response.status_code == 200:
+            predicted_sales = response.json()["Sales"]
+            st.success(f"Predicted Product Store Sales Total: ₹{predicted_sales:.2f}")
+        else:
+            api_error(response)
+    except requests.exceptions.RequestException:
+        st.error("Unable to connect to the prediction API. Check that the backend is running.")
 
 # Batch Prediction
 st.subheader("Batch Prediction")
@@ -64,34 +71,33 @@ uploaded_file = st.file_uploader(
 if uploaded_file is not None:
 
     if st.button("Predict for Batch", type='primary'):
+        file_bytes = uploaded_file.getvalue()
+        try:
+            response = requests.post(
+                f"{BACKEND_URL}/v1/predictbatch",
+                files={"file": (uploaded_file.name, file_bytes, "text/csv")},
+                timeout=60,
+            )
+            if response.status_code == 200:
+                results = response.json()
+                # keys are row indices ("0", "1", ...): sort numerically and attach to the uploaded rows
+                preds = [results[k] for k in sorted(results, key=int)]
+                batch_df = pd.read_csv(io.BytesIO(file_bytes))
+                batch_df.insert(0, "Predicted_Sales", preds)
+                st.session_state["batch_result"] = batch_df
+            else:
+                st.session_state.pop("batch_result", None)
+                api_error(response)
+        except requests.exceptions.RequestException:
+            st.error("Unable to connect to the prediction API. Check that the backend is running.")
 
-        response = requests.post(
-            f"{BACKEND_URL}/v1/predictbatch",
-            files={"file": uploaded_file}
-        )
-
-        if response.status_code == 200:
-            results = response.json()
-
-            st.success("Predictions completed successfully!")
-
-            try:
-                if isinstance(results, list):
-                    df = pd.DataFrame(results)
-                elif isinstance(results, dict):
-                    # Check if all values are scalars
-                    if all(not isinstance(v, (list, dict)) for v in results.values()):
-                        df = pd.DataFrame([results])
-                    else:
-                        df = pd.DataFrame(results)
-                else:
-                    df = pd.DataFrame({"Result": [results]})
-
-                st.dataframe(df, use_container_width=True)
-
-            except Exception as e:
-                st.error(f"Unable to display results as a table: {e}")
-                st.json(results)
-
-        else:
-            st.error("Unable to connect to the prediction API.")
+# Show (and allow download of) the latest batch result
+if "batch_result" in st.session_state:
+    st.success("Predictions completed successfully!")
+    st.dataframe(st.session_state["batch_result"], use_container_width=True)
+    st.download_button(
+        "Download predictions as CSV",
+        st.session_state["batch_result"].to_csv(index=False).encode("utf-8"),
+        file_name="superkart_batch_predictions.csv",
+        mime="text/csv",
+    )
